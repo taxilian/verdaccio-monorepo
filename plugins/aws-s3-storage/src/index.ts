@@ -17,11 +17,25 @@ import { convertS3Error, is404Error } from './s3Errors';
 import addTrailingSlash from './addTrailingSlash';
 import setConfigValue from './setConfigValue';
 
+interface SSEParamsCustomerKey {
+  SSECustomerAlgorithm?: S3.SSECustomerAlgorithm;
+  SSECustomerKey?: S3.SSECustomerKey;
+}
+interface SSEParamsSSES3 {
+  ServerSideEncryption: S3.ServerSideEncryption;
+}
+interface SSEParamsSSEKMS {
+  ServerSideEncryption: 'aws:kms';
+  SSEKMSKeyId: S3.SSEKMSKeyId;
+}
+type SSEParams = SSEParamsCustomerKey | SSEParamsSSES3 | SSEParamsSSEKMS;
 export default class S3Database implements IPluginStorage<S3Config> {
   public logger: Logger;
   public config: S3Config;
   private s3: S3;
   private _localData: LocalStorage | null;
+
+  private _sseParams: SSEParams | undefined;
 
   public constructor(config: Config, options: PluginOptions<S3Config>) {
     this.logger = options.logger;
@@ -42,6 +56,8 @@ export default class S3Database implements IPluginStorage<S3Config> {
     this.config.accessKeyId = setConfigValue(this.config.accessKeyId);
     this.config.secretAccessKey = setConfigValue(this.config.secretAccessKey);
     this.config.sessionToken = setConfigValue(this.config.sessionToken);
+    this.config.SSECustomerAlgorithm = setConfigValue(this.config.SSECustomerAlgorithm);
+    this.config.SSECustomerKey = setConfigValue(this.config.SSECustomerKey);
 
     const configKeyPrefix = this.config.keyPrefix;
     this._localData = null;
@@ -52,6 +68,8 @@ export default class S3Database implements IPluginStorage<S3Config> {
       's3: configuration: @{config}'
     );
 
+    this.initSSE();
+
     this.s3 = new S3({
       endpoint: this.config.endpoint,
       region: this.config.region,
@@ -60,6 +78,52 @@ export default class S3Database implements IPluginStorage<S3Config> {
       secretAccessKey: this.config.secretAccessKey,
       sessionToken: this.config.sessionToken,
     });
+  }
+
+  private initSSE() {
+    const { SSECustomerAlgorithm, SSECustomerKey, ServerSideEncryption, SSEKMSKeyId } = this.config;
+
+    if (SSECustomerKey) {
+      // SSECustomerKey could be a raw string, a HEX-encoded string, or
+      // a base64-encoded string -- but it must be 256 bits / 32 bytes,
+      // so that tells us which it is
+      let customerKey: Buffer;
+      if (SSECustomerKey.length === 32) {
+        // 32 byte string, use it as-is
+        customerKey = Buffer.from(SSECustomerKey);
+      } else if (SSECustomerKey.length === 64) {
+        // this is a hex-encoded key
+        customerKey = Buffer.from(SSECustomerKey, 'hex');
+      } else {
+        // Assume it's base64 encoded -- if it isn't then an exception
+        // will be thrown indicating it's not a valid key
+        customerKey = Buffer.from(SSECustomerKey, 'base64');
+      }
+      this._sseParams = {
+        SSECustomerAlgorithm: SSECustomerAlgorithm || 'AES256',
+        SSECustomerKey: customerKey,
+      };
+    } else if (ServerSideEncryption === 'aws:kms') {
+      this._sseParams = {
+        ServerSideEncryption,
+        SSEKMSKeyId,
+      };
+    } else if (ServerSideEncryption) {
+      this._sseParams = {
+        ServerSideEncryption,
+      };
+    }
+  }
+
+  private get sseOptionsAll() {
+    return this._sseParams || {};
+  }
+  private get sseOptionsRead() {
+    if (this._sseParams && 'SSECustomerKey' in this._sseParams) {
+      return this._sseParams;
+    } else {
+      return {};
+    }
   }
 
   public async getSecret(): Promise<string> {
@@ -110,6 +174,8 @@ export default class S3Database implements IPluginStorage<S3Config> {
         {
           Bucket: bucket,
           Key: `${keyPrefix + packageName}/package.json`,
+          // We only need SSE options if SSE-C is enabled (customer-provided encryption key)
+          ...this.sseOptionsRead,
         },
         (err, response) => {
           if (err) {
@@ -182,6 +248,8 @@ export default class S3Database implements IPluginStorage<S3Config> {
           Bucket: this.config.bucket,
           Key: `${this.config.keyPrefix}verdaccio-s3-db.json`,
           Body: JSON.stringify(this._localData),
+          // If SSE is enabled then all SSE options are needed for put
+          ...this.sseOptionsAll,
         },
         (err) => {
           if (err) {
@@ -216,6 +284,8 @@ export default class S3Database implements IPluginStorage<S3Config> {
           {
             Bucket: bucket,
             Key: `${keyPrefix}verdaccio-s3-db.json`,
+            // We only need SSE options if SSE-C is enabled (customer-provided encryption key)
+            ...this.sseOptionsRead,
           },
           (err, response) => {
             if (err) {

@@ -10,4 +10,8 @@ export interface S3Config extends Config {
   accessKeyId?: string;
   secretAccessKey?: string;
   sessionToken?: string;
+  SSECustomerAlgorithm?: string;
+  SSECustomerKey?: string;
+  ServerSideEncryption?: string;
+  SSEKMSKeyId?: string;
 }
